@@ -1,32 +1,97 @@
 #!/usr/bin/env python
 
-# XSS Exec Checker - Check and verify cross-site-scripting vulnerability of a specific endpoint - breve descrizione
+# XSS Exec Checker - check and verify cross-site-scripting vulnerability of a specific endpoint - breve descrizione
 # Copyright (C) 2025  Davide Quirillo
 # Licensed under the GNU GPL v3 or later. See LICENSE for details.
 
 import random, string
+import re
 import argparse
+import socket
 import requests
 from mimetypes import guess_file_type
+from urllib.parse import urlparse
 
 PAYLOAD_DELIM_LEN = 7
-html_special_chars =['<', '>', '"', "'"]
+html_special_chars = ['<', '>', '"', "'"]
+html_keywords = ['<script>']
 
 def rand_alphanum(n):
     s = ''.join(random.choices(string.ascii_letters + string.digits, k=n))
     return s
 
+def get_response(response):
+    text = ""
+    for k,v in response.headers.items():
+        text += k + ": " + v + "\r\n"
+    text += "\r\n" + response.text
+    return text
+
 def send_request(payload: str):
-    global args, request_bytes, request_headers, request_params
+    global args, request_bytes, request_headers, request_params, manual_redirects
+    t = 10
+    responses = []
 
     if args.request_file:
-        request_bytes = request_bytes.replace(b'XSS', payload.encode(), count=1)
-        pass # send request_bytes() to the server using a tcp socket and receive resp
+        request_bytes = request_bytes.replace(b'XSS', payload.encode())
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        u = urlparse(args.url)
+        u_arr = u.netloc.split(':')
+        if len(u_arr) > 1:
+            host = u_arr[0]
+            port = u_arr[1]
+        else:
+            host = u_arr[0]
+            port = "80"
+        try:
+            client_socket.connect((host, int(port)))
+            client_socket.sendall(request_bytes)
+            resp_bytes = b''
+            while True:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                resp_bytes += data
+            responses.append(resp_bytes.decode())
+        except Exception as e:
+            print('Failed raw request: '+ str(e))
+        finally:
+            client_socket.close()
+        return responses
     else:
-        m = args.method
-        u = args.url
-        # r=requests.post(u, headers=hs_dict)
-        # return requests.post(TARGET, data={PARAM: payload}, timeout=10)
+        try:
+            m = args.method
+            u = args.url
+            u = u.replace(args.payload_mark, payload)
+            pars = {}
+            heads = {}
+            for k, v in request_params.items():
+                pars[k] = v.replace(args.payload_mark, payload)
+            for k, v in request_headers.items():
+                heads[k] = v.replace(args.payload_mark, payload)
+            if (args.method == "post"):
+                resp = requests.post(u, data=pars, headers=heads, timeout=t)
+            elif (args.method == "delete"):
+                resp = requests.delete(u, params=pars, headers=heads, timeout=t)
+            elif (args.method == "put"):
+                resp = requests.put(u, data=pars, headers=heads, timeout=t)
+            else:
+                resp = requests.get(u, params=pars, headers=heads, timeout=t)
+        except Exception as e:
+            print('Failed request: '+ str(e))
+        
+        print("Status:", resp.status_code)
+        
+        while (resp.status_code == 301) and (args.follow_redirects):
+            u = resp.headers['Location']
+            print("Follow redirect:", u)
+            resp = requests.get(u, params=pars, headers=heads, timeout=t)
+        responses.append(get_response(resp))
+        for u in manual_redirects:
+            print("Manual redirect:", u)
+            resp = requests.get(u, params=pars, headers=heads, timeout=t)
+            responses.append(get_response(resp))
+        return responses
 
 def get_args():
     global args
@@ -143,32 +208,69 @@ def init_args():
     payloads = []
     if args.payloads:
         with open(args.payloads, "r", encoding="utf-8") as pf:
-            for pf_line in f:
+            for pf_line in pf:
                 payloads.append(pf_line.rstrip("\r\n"))
     manual_redirects = []
     if args.redirect:
         for r in args.redirect:
-            man_redirects.append(r)
+            manual_redirects.append(r)
 
 def static_check():
     global args
     global request_bytes, request_headers, request_params
     global payloads, manual_redirects
 
+    is_sufficient = True # static check is sufficient?
+
     print("Testing html special chars sanitization...")
-    for c in html_special_chars:
+    html_specials = html_special_chars + html_keywords
+    for c in html_specials:
         print("Character:", f'({c})')
         left_delim = rand_alphanum(PAYLOAD_DELIM_LEN)
         right_delim = rand_alphanum(PAYLOAD_DELIM_LEN)
         test_str = left_delim + c + right_delim
-        send_request(test_str)
+        regex1 = rf'{left_delim}\&(.)+;{right_delim}'
+        regex2 = '{0}(.)*{1}'.format(left_delim, right_delim)
+        responses = send_request(test_str)
+        for r in responses:
+            if test_str in r:
+                print("Vulnerable to XSS probably: ", test_str)
+            elif re.search(regex1, r, re.IGNORECASE):
+                print("Not vulnerable")
+            elif re.search(regex2, r, re.IGNORECASE):
+                print("The target does some filtering, trying dynamic checks...")
+                is_sufficient = False
+            else:
+                print("Not vulnerable (try blind attack)")
         print("Done")
+    return is_sufficient
+
+def blind_attack():
+    global args
+    global request_bytes, request_headers, request_params
+    global payloads
+    
+    for p in payloads:
+        send_request(p) 
 
 def execution_check():
-    pass
+    global args
+    global request_bytes, request_headers, request_params
+    global payloads
+
+    # start/init playwright
+    
+    for p in payloads:
+        responses = send_request(p)
+        for resp in responses: 
+            pass
 
 if __name__ == "__main__":
     get_args()
     init_args()
-    static_check()
-    execution_check()    
+    if args.blind_xss:
+        blind_attack()
+    else:
+        run_test_is_needed = not static_check() 
+        if (run_test_is_needed):
+            execution_check() 
