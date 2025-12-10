@@ -6,15 +6,22 @@
 
 import random, string
 import re
+import os
+import time
 import argparse
 import socket
 import requests
+import html
+import json
 from mimetypes import guess_file_type
 from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright
 
 PAYLOAD_DELIM_LEN = 7
 html_special_chars = ['<', '>', '"', "'"]
 html_keywords = ['<script>']
+OUT = os.path.dirname(__file__) + "/exec_results"
+os.makedirs(OUT, exist_ok=True)
 
 def rand_alphanum(n):
     s = ''.join(random.choices(string.ascii_letters + string.digits, k=n))
@@ -70,26 +77,28 @@ def send_request(payload: str):
             for k, v in request_headers.items():
                 heads[k] = v.replace(args.payload_mark, payload)
             if (args.method == "post"):
-                resp = requests.post(u, data=pars, headers=heads, timeout=t)
+                resp = requests.post(u, allow_redirects=False, data=pars, headers=heads, timeout=t)
             elif (args.method == "delete"):
-                resp = requests.delete(u, params=pars, headers=heads, timeout=t)
+                resp = requests.delete(u, allow_redirects=False, params=pars, headers=heads, timeout=t)
             elif (args.method == "put"):
-                resp = requests.put(u, data=pars, headers=heads, timeout=t)
+                resp = requests.put(u, allow_redirects=False, data=pars, headers=heads, timeout=t)
             else:
-                resp = requests.get(u, params=pars, headers=heads, timeout=t)
+                resp = requests.get(u, allow_redirects=False, params=pars, headers=heads, timeout=t)
         except Exception as e:
             print('Failed request: '+ str(e))
         
         print("Status:", resp.status_code)
         
-        while (resp.status_code == 301) and (args.follow_redirects):
-            u = resp.headers['Location']
+        while ((resp.status_code==301) or (resp.status_code==302)) and (args.follow_redirects):
+            loc = resp.headers['Location']
+            uparsed = urlparse(u)
+            u = uparsed.scheme + "://" + uparsed.netloc + "/" + loc.lstrip("/")
             print("Follow redirect:", u)
-            resp = requests.get(u, params=pars, headers=heads, timeout=t)
+            resp = requests.get(u, allow_redirects=False, params=pars, headers=heads, timeout=t)
         responses.append(get_response(resp))
         for u in manual_redirects:
             print("Manual redirect:", u)
-            resp = requests.get(u, params=pars, headers=heads, timeout=t)
+            resp = requests.get(u, allow_redirects=False, params=pars, headers=heads, timeout=t)
             responses.append(get_response(resp))
         return responses
 
@@ -241,7 +250,7 @@ def static_check():
                 print("The target does some filtering, trying dynamic checks...")
                 is_sufficient = False
             else:
-                print("Not vulnerable (try blind attack)")
+                print("Undefined (try blind attack)")
         print("Done")
     return is_sufficient
 
@@ -260,10 +269,113 @@ def execution_check():
 
     # start/init playwright
     
-    for p in payloads:
-        responses = send_request(p)
-        for resp in responses: 
-            pass
+    if len(payloads) > 0:
+        payls = payloads
+    else:
+        payls = ["<script>alert(1)</script>", '<img src=x onerror=console.log("XSS")>']
+
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context()
+
+        for i, pl in enumerate(payls,1):
+            print(f"[{i}/{len(payls)}] testing")
+            try:
+                responses = send_request(pl)
+            except Exception as e:
+                results.append({"payload":pl,"error":str(e)})
+                continue
+            for resp in responses:
+                page = ctx.new_page()
+                if pl not in resp and html.escape(pl) not in resp:
+                    note = "Payload not reflected"
+                    results.append({"payload":pl, "reflected":False, "note":note})
+                    continue
+
+                # evidence containers
+                dialogs=[]; consoles=[]; page_errors=[]; requests_made=[]; mutations=[]
+
+                # expose mutation recorder
+                def rec(m): 
+                    mutations.append(m)
+                
+                page.expose_function("py_rec", rec)
+
+                def on_dialog(d): 
+                    dialogs.append({"type":d.type,"msg":d.message})
+                    try: 
+                        d.dismiss()
+                    except: 
+                        pass
+                
+                def on_console(m): 
+                    consoles.append({"type":m.type,"text":m.text})
+                
+                def on_page_error(e): 
+                    page_errors.append(str(e))
+                
+                def on_request(req): 
+                    requests_made.append({"url":req.url,"method":req.method})
+
+                page.on("dialog", on_dialog)
+                page.on("console", on_console)
+                page.on("pageerror", on_page_error)
+                page.on("request", on_request)
+
+                # try load raw response; if fails, wrap payload in simple HTML
+                try:
+                    page.set_content(resp, wait_until="load", timeout=5000)
+                except Exception:
+                    wrapper = f"<!doctype html><html><body>{html.escape(pl)}</body></html>"
+                    page.set_content(wrapper, wait_until="load", timeout=5000)
+
+                # inject MutationObserver to call py_rec
+                page.evaluate("""
+                (() => {
+                    const obs = new MutationObserver(muts => {
+                    muts.forEach(m => {
+                        const rec = {
+                        type: m.type,
+                        target: m.target ? (m.target.tagName || m.target.nodeName) : null,
+                        added: Array.from(m.addedNodes||[]).slice(0,3).map(n => (n.outerHTML||n.nodeValue||'').slice(0,300)),
+                        attr: m.attributeName
+                        };
+                        if (window.py_rec) window.py_rec(rec).catch(e => console.error('py_rec fail',e));
+                    });
+                    });
+                    obs.observe(document, {childList:true, subtree:true, attributes:true});
+                })()
+                """)
+
+                time.sleep(0.8)  # wait for async scripts
+
+                # evidence
+                screenshot = os.path.join(OUT,f"p{i}.png")
+                try: page.screenshot(path=screenshot, full_page=True)
+                except: screenshot=None
+                dom = page.content()
+                domfile = os.path.join(OUT, f"p{i}.html")
+                open(domfile,"w",encoding="utf-8").write(dom)
+
+                executed = bool(dialogs or consoles or requests_made or mutations or page_errors)
+                results.append({
+                    "payload":pl,
+                    "reflected": True,
+                    "executed": executed,
+                    "dialogs": dialogs,
+                    "console": consoles,
+                    "requests": requests_made,
+                    "mutations": mutations,
+                    "page_errors": page_errors,
+                    "screenshot": screenshot,
+                    "domfile": domfile
+                })
+                # cleanup
+                page.close()
+
+        browser.close()
+    print(json.dumps(results, indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     get_args()
