@@ -9,7 +9,7 @@ Clone the repository.
 
 ## Requirements
 
-It requires "Playwright for Python" (browser engine)
+It requires "Playwright for Python" (browser engine).
 
 ## Usage
 
